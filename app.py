@@ -3,11 +3,15 @@ import streamlit as st
 import pandas as pd
 import re
 import io
+import json
 import unicodedata
+from collections import Counter
 from rapidfuzz import fuzz, process
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(
-    page_title="المطابقة الذكية لملفات Excel",
+    page_title="Smart Excel Matcher",
     page_icon="📊",
     layout="wide"
 )
@@ -19,11 +23,12 @@ html, body, [class*="css"] {
     text-align: right;
 }
 .stApp { direction: rtl; }
+[data-testid="stDataFrame"] { direction: rtl; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 برنامج المطابقة الذكية لملفات Excel")
-st.caption("مطابقة دقيقة بالمفاتيح المحددة أو مطابقة ذكية متعددة الحقول")
+st.title("📊 Smart Excel Matcher")
+st.caption("نظام متقدم لمطابقة ومقارنة ملفات Excel")
 
 WEIGHTS = {
     "الاسم": 40,
@@ -33,7 +38,11 @@ WEIGHTS = {
 }
 
 
-def normalize(value):
+# -------------------------
+# أدوات تنظيف البيانات
+# -------------------------
+
+def clean_text(value):
     if pd.isna(value):
         return ""
     value = str(value).strip()
@@ -41,473 +50,762 @@ def normalize(value):
     value = re.sub(r"[\u064B-\u065F\u0670]", "", value)
     value = value.replace("ـ", "")
     value = value.translate(str.maketrans(
-        "أإآىؤئ",
-        "ااايوي"
+        "أإآىؤئ", "ااايوي"
     ))
     value = re.sub(r"\s+", " ", value)
     return value.lower().strip()
 
 
-def normalize_number(value):
-    value = normalize(value)
-    arabic_digits = "٠١٢٣٤٥٦٧٨٩"
-    persian_digits = "۰۱۲۳۴۵۶۷۸۹"
-    english_digits = "0123456789"
-    value = value.translate(str.maketrans(arabic_digits, english_digits))
-    value = value.translate(str.maketrans(persian_digits, english_digits))
+def clean_number(value):
+    value = clean_text(value)
+    arabic = "٠١٢٣٤٥٦٧٨٩"
+    persian = "۰۱۲۳۴۵۶۷۸۹"
+    english = "0123456789"
+    value = value.translate(str.maketrans(arabic, english))
+    value = value.translate(str.maketrans(persian, english))
     value = re.sub(r"\s+", "", value)
     return value
 
 
-def read_excel(uploaded_file):
+def normalize_value(value, numeric=False):
+    return clean_number(value) if numeric else clean_text(value)
+
+
+def read_uploaded_excel(uploaded_file, label):
     excel = pd.ExcelFile(uploaded_file)
     sheet = st.selectbox(
-        f"اختر ورقة العمل في {uploaded_file.name}",
+        f"ورقة العمل - {label}",
         excel.sheet_names,
-        key=f"sheet_{uploaded_file.name}"
+        key=f"sheet_{label}"
     )
-    return pd.read_excel(uploaded_file, sheet_name=sheet, dtype=str).fillna("")
+    df = pd.read_excel(
+        uploaded_file,
+        sheet_name=sheet,
+        dtype=str
+    ).fillna("")
+    return df.reset_index(drop=True)
 
 
-def make_key(row, columns):
-    values = []
-    for col in columns:
-        values.append(normalize_number(row[col]))
+def build_key(row, columns):
+    values = [clean_number(row[c]) for c in columns]
+    if not values or any(v == "" for v in values):
+        return ""
     return "||".join(values)
 
 
-def similarity(a, b):
-    if not a or not b:
-        return None
-    return fuzz.ratio(a, b)
+def find_duplicates(df, columns):
+    if not columns:
+        return pd.DataFrame()
+    keys = df.apply(lambda r: build_key(r, columns), axis=1)
+    mask = (keys != "") & keys.duplicated(keep=False)
+    result = df.loc[mask].copy()
+    if not result.empty:
+        result.insert(0, "رقم الصف في الملف", result.index + 2)
+        result.insert(1, "مفتاح التكرار", keys.loc[mask])
+    return result.reset_index(drop=True)
 
 
-def score_rows(row1, row2, fields):
+def weighted_score(row_a, row_b, fields):
     total = 0
     used_weight = 0
     details = {}
 
-    for field, columns in fields.items():
-        col1, col2 = columns
-        a = normalize(row1[col1])
-        b = normalize(row2[col2])
+    for field, (col_a, col_b) in fields.items():
+        a = row_a[col_a]
+        b = row_b[col_b]
+        numeric = field in ["رقم الهوية", "رقم الحساب"]
+
+        a = normalize_value(a, numeric)
+        b = normalize_value(b, numeric)
+
+        if not a or not b:
+            details[field] = "غير متوفر"
+            continue
+
+        score = fuzz.ratio(a, b)
+        weight = WEIGHTS[field]
+        total += score * weight
+        used_weight += weight
+        details[field] = round(score, 1)
+
+    score = total / used_weight if used_weight else 0
+    return round(score, 1), details
+
+
+def score_label(score):
+    if score >= 95:
+        return "مرتفع جداً"
+    if score >= 85:
+        return "مرتفع"
+    if score >= 70:
+        return "يحتاج مراجعة"
+    return "ضعيف"
+
+
+def compare_fields(row_a, row_b, fields):
+    equal_fields = []
+    different_fields = []
+
+    for field, (col_a, col_b) in fields.items():
+        numeric = field in ["رقم الهوية", "رقم الحساب"]
+        a = normalize_value(row_a[col_a], numeric)
+        b = normalize_value(row_b[col_b], numeric)
 
         if not a or not b:
             continue
 
-        if field in ["رقم الهوية", "رقم الحساب"]:
-            a = normalize_number(row1[col1])
-            b = normalize_number(row2[col2])
+        if a == b:
+            equal_fields.append(field)
+        else:
+            different_fields.append(field)
 
-        value = fuzz.ratio(a, b)
-        weight = WEIGHTS[field]
-        total += value * weight
-        used_weight += weight
-        details[field] = round(value, 1)
-
-    final_score = total / used_weight if used_weight else 0
-    return round(final_score, 1), details
+    return "، ".join(equal_fields), "، ".join(different_fields)
 
 
-def category(score):
-    if score >= 95:
-        return "تطابق مرتفع جداً"
-    if score >= 85:
-        return "تطابق مرتفع"
-    if score >= 70:
-        return "يحتاج مراجعة"
-    return "تطابق ضعيف"
+# -------------------------
+# المطابقة الدقيقة
+# -------------------------
+
+def exact_match(source, target, source_cols, target_cols,
+                target_output_cols, direction):
+
+    target_keys = target.apply(
+        lambda r: build_key(r, target_cols), axis=1
+    )
+    source_keys = source.apply(
+        lambda r: build_key(r, source_cols), axis=1
+    )
+
+    lookup = {}
+    for idx, key in target_keys.items():
+        if key:
+            lookup.setdefault(key, []).append(idx)
+
+    records = []
+    matched_target = set()
+
+    for idx, row in source.iterrows():
+        key = source_keys.loc[idx]
+        matches = lookup.get(key, [])
+
+        record = {
+            "اتجاه المطابقة": direction,
+            "صف الملف المرجعي": idx + 2,
+            "مفتاح المطابقة": key
+        }
+
+        for col in source.columns:
+            record[f"الملف المرجعي - {col}"] = row[col]
+
+        if not key:
+            status = "مفتاح فارغ"
+            target_idx = None
+        elif len(matches) > 1:
+            status = "مفتاح مكرر في الملف المقابل"
+            target_idx = None
+        elif len(matches) == 1:
+            status = "متطابق"
+            target_idx = matches[0]
+            matched_target.add(target_idx)
+        else:
+            status = "غير موجود في الملف المقابل"
+            target_idx = None
+
+        record["حالة المطابقة"] = status
+        record["صف الملف المقابل"] = (
+            target_idx + 2 if target_idx is not None else ""
+        )
+
+        for col in target_output_cols:
+            record[f"الملف المقابل - {col}"] = (
+                target.loc[target_idx, col]
+                if target_idx is not None else ""
+            )
+
+        records.append(record)
+
+    results = pd.DataFrame(records)
+
+    unmatched = target.loc[
+        ~target.index.isin(matched_target)
+    ].copy()
+
+    if not unmatched.empty:
+        unmatched.insert(0, "صف الملف المقابل", unmatched.index + 2)
+        unmatched.insert(1, "اتجاه المطابقة", direction)
+
+    return results, unmatched
 
 
-def to_excel(results, summary, duplicates1=None, duplicates2=None):
+# -------------------------
+# المطابقة الذكية
+# -------------------------
+
+def smart_match(source, target, fields, output_cols,
+                threshold, one_to_one, direction):
+
+    target_names = []
+    name_field = fields.get("الاسم")
+
+    if name_field:
+        target_names = [
+            clean_text(v) for v in target[name_field[1]].tolist()
+        ]
+
+    used_target = set()
+    matched_target = set()
+    records = []
+
+    for idx, row in source.iterrows():
+        candidates = set()
+
+        # مرشحون من أرقام الهوية والحساب
+        for field in ["رقم الهوية", "رقم الحساب"]:
+            if field in fields:
+                source_col, target_col = fields[field]
+                value = clean_number(row[source_col])
+                if value:
+                    matches = target.index[
+                        target[target_col].apply(clean_number) == value
+                    ].tolist()
+                    candidates.update(matches)
+
+        # مرشحون من الاسم
+        if name_field:
+            query = clean_text(row[name_field[0]])
+            if query and target_names:
+                found = process.extract(
+                    query,
+                    target_names,
+                    scorer=fuzz.ratio,
+                    limit=15
+                )
+                for _, score, pos in found:
+                    if score >= 40:
+                        candidates.add(target.index[pos])
+
+        # عند غياب المرشحين، نفحص الملف كاملاً إذا كان حجمه مناسباً
+        if not candidates and len(target) <= 3000:
+            candidates = set(target.index.tolist())
+
+        best_idx = None
+        best_score = -1
+        best_details = {}
+
+        for candidate_idx in candidates:
+            if one_to_one and candidate_idx in used_target:
+                continue
+
+            score, details = weighted_score(
+                row, target.loc[candidate_idx], fields
+            )
+
+            if score > best_score:
+                best_score = score
+                best_idx = candidate_idx
+                best_details = details
+
+        record = {
+            "اتجاه المطابقة": direction,
+            "صف الملف المرجعي": idx + 2
+        }
+
+        for col in source.columns:
+            record[f"الملف المرجعي - {col}"] = row[col]
+
+        if best_idx is None:
+            status = "غير موجود"
+            record["نسبة التطابق"] = 0
+            record["تصنيف التطابق"] = "غير موجود"
+            record["الحقول المتطابقة"] = ""
+            record["الحقول المختلفة"] = ""
+            record["صف الملف المقابل"] = ""
+        else:
+            target_row = target.loc[best_idx]
+            equal, different = compare_fields(row, target_row, fields)
+
+            record["نسبة التطابق"] = best_score
+            record["تصنيف التطابق"] = score_label(best_score)
+            record["الحقول المتطابقة"] = equal
+            record["الحقول المختلفة"] = different
+            record["صف الملف المقابل"] = best_idx + 2
+
+            if best_score < threshold:
+                status = "يحتاج مراجعة"
+            elif best_score >= 95:
+                status = "تطابق مرتفع جداً"
+                used_target.add(best_idx)
+                matched_target.add(best_idx)
+            else:
+                status = "تطابق مرتفع - مراجعة"
+                used_target.add(best_idx)
+                matched_target.add(best_idx)
+
+        record["حالة المطابقة"] = status
+
+        for field in WEIGHTS:
+            record[f"نسبة {field}"] = best_details.get(field, "")
+
+        for col in output_cols:
+            record[f"الملف المقابل - {col}"] = (
+                target.loc[best_idx, col]
+                if best_idx is not None else ""
+            )
+
+        records.append(record)
+
+    results = pd.DataFrame(records)
+
+    unmatched = target.loc[
+        ~target.index.isin(matched_target)
+    ].copy()
+
+    if not unmatched.empty:
+        unmatched.insert(0, "صف الملف المقابل", unmatched.index + 2)
+        unmatched.insert(1, "اتجاه المطابقة", direction)
+
+    return results, unmatched
+
+
+# -------------------------
+# تقرير Excel منسق
+# -------------------------
+
+def make_report(sheets):
     output = io.BytesIO()
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="ملخص التحليل", index=False)
-        results.to_excel(writer, sheet_name="كل النتائج", index=False)
-
-        review = results[
-            results["حالة المطابقة"].astype(str).str.contains(
-                "مراجعة|مكرر|ضعيف", na=False
+        for sheet_name, data in sheets.items():
+            if data is None:
+                continue
+            if not isinstance(data, pd.DataFrame):
+                data = pd.DataFrame(data)
+            data.to_excel(
+                writer,
+                sheet_name=sheet_name[:31],
+                index=False
             )
-        ]
-        review.to_excel(writer, sheet_name="يحتاج مراجعة", index=False)
 
-        missing = results[
-            results["حالة المطابقة"].astype(str).str.contains(
-                "غير موجود", na=False
-            )
-        ]
-        missing.to_excel(writer, sheet_name="غير موجود", index=False)
+        workbook = writer.book
 
-        if duplicates1 is not None:
-            duplicates1.to_excel(writer, sheet_name="تكرار الملف الأول", index=False)
-        if duplicates2 is not None:
-            duplicates2.to_excel(writer, sheet_name="تكرار الملف الثاني", index=False)
+        header_fill = PatternFill(
+            "solid", fgColor="6B244A"
+        )
+        header_font = Font(
+            color="FFFFFF", bold=True, name="Arial"
+        )
+        normal_font = Font(name="Arial", size=10)
+
+        for ws in workbook.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            ws.sheet_view.rightToLeft = True
+
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=True
+                )
+
+            ws.row_dimensions[1].height = 32
+
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = normal_font
+                    cell.alignment = Alignment(
+                        horizontal="right",
+                        vertical="center",
+                        wrap_text=True
+                    )
+
+            for col_idx, column_cells in enumerate(
+                ws.columns, start=1
+            ):
+                values = [
+                    len(str(cell.value or ""))
+                    for cell in list(column_cells)[:150]
+                ]
+                width = min(max(max(values, default=10) + 2, 12), 35)
+                ws.column_dimensions[
+                    get_column_letter(col_idx)
+                ].width = width
 
     output.seek(0)
     return output
 
 
-st.markdown("### 1. رفع ملفات Excel")
+# -------------------------
+# واجهة التطبيق
+# -------------------------
 
-c1, c2 = st.columns(2)
-with c1:
-    file1 = st.file_uploader("الملف الأول", type=["xlsx", "xls"], key="file1")
-with c2:
-    file2 = st.file_uploader("الملف الثاني", type=["xlsx", "xls"], key="file2")
+st.header("1. رفع الملفين")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    file1 = st.file_uploader(
+        "الملف الأول",
+        type=["xlsx", "xls"],
+        key="upload1"
+    )
+
+with col2:
+    file2 = st.file_uploader(
+        "الملف الثاني",
+        type=["xlsx", "xls"],
+        key="upload2"
+    )
+
 
 if file1 and file2:
     try:
-        df1 = read_excel(file1)
-        df2 = read_excel(file2)
+        df1 = read_uploaded_excel(file1, "الأول")
+        df2 = read_uploaded_excel(file2, "الثاني")
 
         st.success(
-            f"تم تحميل الملفين بنجاح: "
-            f"{len(df1)} صفاً في الملف الأول، و{len(df2)} صفاً في الملف الثاني."
+            f"تم تحميل الملفين: {len(df1)} صفاً في الأول "
+            f"و{len(df2)} صفاً في الثاني."
         )
 
-        st.markdown("### 2. اختر طريقة المطابقة")
+        st.header("2. إعداد المطابقة")
 
         mode = st.radio(
-            "طريقة المطابقة",
+            "نوع المطابقة",
             [
-                "المطابقة بالمفتاح المحدد (مثل VLOOKUP)",
-                "المطابقة الذكية متعددة الحقول"
+                "مطابقة دقيقة بالمفاتيح (مثل VLOOKUP)",
+                "مطابقة ذكية متعددة الحقول"
             ],
-            horizontal=False
+            horizontal=True
         )
 
-        st.markdown("### 3. إعداد أعمدة المطابقة")
+        direction = st.selectbox(
+            "اتجاه المطابقة",
+            [
+                "الملف الأول مقابل الثاني",
+                "الملف الثاني مقابل الأول",
+                "المطابقة في الاتجاهين"
+            ]
+        )
 
-        if mode == "المطابقة بالمفتاح المحدد (مثل VLOOKUP)":
+        if mode == "مطابقة دقيقة بالمفاتيح (مثل VLOOKUP)":
             st.info(
-                "اختر عموداً واحداً أو عدة أعمدة من كل ملف. "
+                "اختر عموداً أو أكثر من كل ملف. "
                 "يجب أن يكون ترتيب الأعمدة المختارة متقابلاً."
             )
 
-            k1, k2 = st.columns(2)
-            with k1:
-                key_cols1 = st.multiselect(
-                    "مفاتيح المطابقة من الملف الأول",
+            a, b = st.columns(2)
+
+            with a:
+                keys1 = st.multiselect(
+                    "مفاتيح الملف الأول",
                     list(df1.columns),
-                    key="key_cols1"
-                )
-            with k2:
-                key_cols2 = st.multiselect(
-                    "مفاتيح المطابقة من الملف الثاني",
-                    list(df2.columns),
-                    key="key_cols2"
+                    key="exact_keys1"
                 )
 
-            output_cols = st.multiselect(
-                "الأعمدة المطلوب جلبها من الملف الثاني",
-                list(df2.columns),
-                default=list(df2.columns)
+            with b:
+                keys2 = st.multiselect(
+                    "مفاتيح الملف الثاني",
+                    list(df2.columns),
+                    key="exact_keys2"
+                )
+
+            output1 = st.multiselect(
+                "أعمدة الملف الأول في التقرير",
+                list(df1.columns),
+                default=list(df1.columns),
+                key="exact_out1"
             )
 
-            if st.button("ابدأ المطابقة", type="primary", key="run_key"):
-                if not key_cols1 or not key_cols2:
-                    st.error("يرجى اختيار أعمدة المطابقة من الملفين.")
-                elif len(key_cols1) != len(key_cols2):
-                    st.error("يجب اختيار العدد نفسه من الأعمدة في الملفين.")
+            output2 = st.multiselect(
+                "أعمدة الملف الثاني في التقرير",
+                list(df2.columns),
+                default=list(df2.columns),
+                key="exact_out2"
+            )
+
+            if st.button(
+                "ابدأ المطابقة الدقيقة",
+                type="primary",
+                key="exact_start"
+            ):
+                if not keys1 or not keys2:
+                    st.error("اختر مفاتيح المطابقة من الملفين.")
+                elif len(keys1) != len(keys2):
+                    st.error("عدد أعمدة المفاتيح يجب أن يكون متساوياً.")
                 else:
-                    keys1 = df1.apply(lambda r: make_key(r, key_cols1), axis=1)
-                    keys2 = df2.apply(lambda r: make_key(r, key_cols2), axis=1)
+                    directions = []
 
-                    duplicate_keys1 = keys1[keys1.duplicated(keep=False)]
-                    duplicate_keys2 = keys2[keys2.duplicated(keep=False)]
-
-                    duplicate_report1 = df1.loc[duplicate_keys1.index].copy()
-                    duplicate_report2 = df2.loc[duplicate_keys2.index].copy()
-
-                    counts2 = keys2.value_counts()
-                    lookup = {}
-                    for idx, key in enumerate(keys2):
-                        lookup.setdefault(key, []).append(idx)
-
-                    records = []
-                    for idx, row in df1.iterrows():
-                        key = keys1.loc[idx]
-                        matches = lookup.get(key, [])
-
-                        record = {
-                            "صف الملف الأول": idx + 2,
-                            "مفتاح المطابقة": key
-                        }
-
-                        for col in df1.columns:
-                            record[f"الملف الأول - {col}"] = row[col]
-
-                        if not key.replace("|", "").strip():
-                            status = "مفتاح فارغ"
-                            match_idx = None
-                        elif len(matches) > 1:
-                            status = "مكرر في الملف الثاني"
-                            match_idx = None
-                        elif len(matches) == 1:
-                            status = "متطابق"
-                            match_idx = matches[0]
-                        else:
-                            status = "غير موجود في الملف الثاني"
-                            match_idx = None
-
-                        record["حالة المطابقة"] = status
-                        record["صف الملف الثاني"] = (
-                            matches[0] + 2 if len(matches) == 1 else ""
+                    if direction in [
+                        "الملف الأول مقابل الثاني",
+                        "المطابقة في الاتجاهين"
+                    ]:
+                        directions.append(
+                            (df1, df2, keys1, keys2,
+                             output2, "الأول مقابل الثاني")
                         )
 
-                        for col in output_cols:
-                            record[f"الملف الثاني - {col}"] = (
-                                df2.iloc[match_idx][col]
-                                if match_idx is not None else ""
-                            )
+                    if direction in [
+                        "الملف الثاني مقابل الأول",
+                        "المطابقة في الاتجاهين"
+                    ]:
+                        directions.append(
+                            (df2, df1, keys2, keys1,
+                             output1, "الثاني مقابل الأول")
+                        )
 
-                        records.append(record)
+                    all_results = []
+                    all_unmatched = []
 
-                    results = pd.DataFrame(records)
+                    for source, target, sk, tk, out_cols, label in directions:
+                        result, unmatched = exact_match(
+                            source, target, sk, tk,
+                            out_cols, label
+                        )
+                        all_results.append(result)
+                        all_unmatched.append(unmatched)
+
+                    results = pd.concat(
+                        all_results, ignore_index=True
+                    )
+                    unmatched = pd.concat(
+                        all_unmatched, ignore_index=True
+                    )
+
+                    duplicate1 = find_duplicates(df1, keys1)
+                    duplicate2 = find_duplicates(df2, keys2)
 
                     summary = pd.DataFrame({
                         "المؤشر": [
                             "عدد صفوف الملف الأول",
                             "عدد صفوف الملف الثاني",
-                            "السجلات المتطابقة",
-                            "غير الموجودة",
-                            "المكررة في الملف الثاني",
-                            "المفاتيح الفارغة",
-                            "المفاتيح المكررة في الملف الأول"
+                            "عدد السجلات المتطابقة",
+                            "عدد المفاتيح الفارغة",
+                            "عدد المفاتيح المكررة في الأول",
+                            "عدد المفاتيح المكررة في الثاني",
+                            "عدد السجلات غير المقابلة"
                         ],
                         "العدد": [
                             len(df1),
                             len(df2),
                             (results["حالة المطابقة"] == "متطابق").sum(),
-                            (results["حالة المطابقة"] == "غير موجود في الملف الثاني").sum(),
-                            (results["حالة المطابقة"] == "مكرر في الملف الثاني").sum(),
                             (results["حالة المطابقة"] == "مفتاح فارغ").sum(),
-                            len(duplicate_report1)
+                            len(duplicate1),
+                            len(duplicate2),
+                            len(unmatched)
                         ]
                     })
 
-                    st.session_state["results"] = results
-                    st.session_state["summary"] = summary
-                    st.session_state["dup1"] = duplicate_report1
-                    st.session_state["dup2"] = duplicate_report2
+                    st.session_state["report_sheets"] = {
+                        "ملخص التحليل": summary,
+                        "كل النتائج": results,
+                        "غير المقابلة": unmatched,
+                        "تكرار الملف الأول": duplicate1,
+                        "تكرار الملف الثاني": duplicate2
+                    }
 
         else:
             st.info(
-                "اختر الحقول المتاحة في كل ملف. "
-                "يمكن ترك أي حقل غير متوفر دون اختيار."
+                "اختر الحقول التي تريد استخدامها. "
+                "يمكن اختيار حقل واحد أو عدة حقول."
             )
 
             fields = {}
+
             for field in WEIGHTS:
-                st.markdown(f"**{field}**")
                 a, b = st.columns(2)
+
                 with a:
-                    col_a = st.selectbox(
+                    ca = st.selectbox(
                         f"{field} - الملف الأول",
-                        ["— بدون اختيار —"] + list(df1.columns),
-                        key=f"a_{field}"
+                        ["بدون اختيار"] + list(df1.columns),
+                        key=f"smart_a_{field}"
                     )
+
                 with b:
-                    col_b = st.selectbox(
+                    cb = st.selectbox(
                         f"{field} - الملف الثاني",
-                        ["— بدون اختيار —"] + list(df2.columns),
-                        key=f"b_{field}"
+                        ["بدون اختيار"] + list(df2.columns),
+                        key=f"smart_b_{field}"
                     )
 
-                if col_a != "— بدون اختيار —" and col_b != "— بدون اختيار —":
-                    fields[field] = (col_a, col_b)
-
-            output_cols = st.multiselect(
-                "الأعمدة المطلوب إظهارها من الملف الثاني",
-                list(df2.columns),
-                default=list(df2.columns),
-                key="smart_output"
-            )
+                if ca != "بدون اختيار" and cb != "بدون اختيار":
+                    fields[field] = (ca, cb)
 
             threshold = st.slider(
-                "الحد الأدنى لقبول المرشح للمطابقة",
-                min_value=50,
-                max_value=100,
-                value=70
+                "الحد الأدنى لنسبة المطابقة",
+                50, 100, 70
             )
 
             one_to_one = st.checkbox(
-                "منع استخدام سجل الملف الثاني لأكثر من سجل",
+                "عدم استخدام السجل المقابل لأكثر من مرة",
                 value=True
             )
 
-            if st.button("ابدأ المطابقة الذكية", type="primary", key="run_smart"):
+            output1 = st.multiselect(
+                "أعمدة الملف الأول في التقرير",
+                list(df1.columns),
+                default=list(df1.columns),
+                key="smart_out1"
+            )
+
+            output2 = st.multiselect(
+                "أعمدة الملف الثاني في التقرير",
+                list(df2.columns),
+                default=list(df2.columns),
+                key="smart_out2"
+            )
+
+            if st.button(
+                "ابدأ المطابقة الذكية",
+                type="primary",
+                key="smart_start"
+            ):
                 if not fields:
-                    st.error("يرجى اختيار حقل واحد على الأقل من الملفين.")
+                    st.error("اختر حقلاً واحداً على الأقل.")
                 else:
-                    name_cols = fields.get("الاسم")
-                    if name_cols:
-                        name_values = [
-                            normalize(v) for v in df2[name_cols[1]].tolist()
-                        ]
-                    else:
-                        name_values = []
+                    directions = []
 
-                    used = set()
-                    records = []
+                    if direction in [
+                        "الملف الأول مقابل الثاني",
+                        "المطابقة في الاتجاهين"
+                    ]:
+                        directions.append(
+                            (df1, df2, fields, output2,
+                             "الأول مقابل الثاني")
+                        )
 
-                    for idx, row in df1.iterrows():
-                        candidates = set()
+                    if direction in [
+                        "الملف الثاني مقابل الأول",
+                        "المطابقة في الاتجاهين"
+                    ]:
+                        reverse_fields = {
+                            field: (pair[1], pair[0])
+                            for field, pair in fields.items()
+                        }
+                        directions.append(
+                            (df2, df1, reverse_fields, output1,
+                             "الثاني مقابل الأول")
+                        )
 
-                        # البحث عن مرشحين عبر القيم الدقيقة للهوية والحساب
-                        for field in ["رقم الهوية", "رقم الحساب"]:
-                            if field in fields:
-                                c1, c2 = fields[field]
-                                value = normalize_number(row[c1])
-                                if value:
-                                    matches = df2.index[
-                                        df2[c2].apply(normalize_number) == value
-                                    ].tolist()
-                                    candidates.update(matches)
+                    all_results = []
+                    all_unmatched = []
 
-                        # البحث التقريبي بالاسم
-                        if name_cols:
-                            query = normalize(row[name_cols[0]])
-                            if query and name_values:
-                                found = process.extract(
-                                    query,
-                                    name_values,
-                                    scorer=fuzz.ratio,
-                                    limit=10
-                                )
-                                for _, value_score, pos in found:
-                                    if value_score >= 40:
-                                        candidates.add(df2.index[pos])
+                    for source, target, selected_fields, out_cols, label in directions:
+                        result, unmatched = smart_match(
+                            source,
+                            target,
+                            selected_fields,
+                            out_cols,
+                            threshold,
+                            one_to_one,
+                            label
+                        )
+                        all_results.append(result)
+                        all_unmatched.append(unmatched)
 
-                        # عند عدم وجود مرشح واضح، افحص كل السجلات إذا كان الملف صغيراً
-                        if not candidates and len(df2) <= 3000:
-                            candidates = set(df2.index.tolist())
-
-                        best_idx = None
-                        best_score = -1
-                        best_details = {}
-
-                        for candidate_idx in candidates:
-                            if one_to_one and candidate_idx in used:
-                                continue
-
-                            candidate = df2.loc[candidate_idx]
-                            score, details = score_rows(row, candidate, fields)
-
-                            if score > best_score:
-                                best_score = score
-                                best_idx = candidate_idx
-                                best_details = details
-
-                        record = {"صف الملف الأول": idx + 2}
-                        for col in df1.columns:
-                            record[f"الملف الأول - {col}"] = row[col]
-
-                        if best_idx is None or best_score < threshold:
-                            record["نسبة التطابق"] = (
-                                best_score if best_idx is not None else 0
-                            )
-                            record["تصنيف التطابق"] = (
-                                category(best_score) if best_idx is not None else "غير موجود"
-                            )
-                            record["حالة المطابقة"] = (
-                                "يحتاج مراجعة" if best_idx is not None else "غير موجود"
-                            )
-                            record["صف الملف الثاني"] = ""
-                            for col in output_cols:
-                                record[f"الملف الثاني - {col}"] = ""
-                        else:
-                            used.add(best_idx)
-                            record["نسبة التطابق"] = best_score
-                            record["تصنيف التطابق"] = category(best_score)
-                            record["حالة المطابقة"] = (
-                                "متطابق" if best_score >= 95 else
-                                "يحتاج مراجعة"
-                            )
-                            record["صف الملف الثاني"] = best_idx + 2
-
-                            for col in output_cols:
-                                record[f"الملف الثاني - {col}"] = df2.loc[best_idx, col]
-
-                        for field in WEIGHTS:
-                            record[f"نسبة {field}"] = best_details.get(field, "")
-
-                        records.append(record)
-
-                    results = pd.DataFrame(records)
+                    results = pd.concat(
+                        all_results, ignore_index=True
+                    )
+                    unmatched = pd.concat(
+                        all_unmatched, ignore_index=True
+                    )
 
                     summary = pd.DataFrame({
                         "المؤشر": [
                             "عدد صفوف الملف الأول",
                             "عدد صفوف الملف الثاني",
                             "تطابق مرتفع جداً",
-                            "تطابق مرتفع",
+                            "تطابق مرتفع - مراجعة",
                             "يحتاج مراجعة",
-                            "غير موجود"
+                            "غير موجود",
+                            "غير المقابل في الاتجاه المحدد"
                         ],
                         "العدد": [
                             len(df1),
                             len(df2),
-                            (results["نسبة التطابق"] >= 95).sum(),
-                            ((results["نسبة التطابق"] >= 85) &
-                             (results["نسبة التطابق"] < 95)).sum(),
-                            ((results["نسبة التطابق"] >= threshold) &
-                             (results["نسبة التطابق"] < 85)).sum(),
-                            (results["حالة المطابقة"] == "غير موجود").sum()
+                            (results["حالة المطابقة"] == "تطابق مرتفع جداً").sum(),
+                            (results["حالة المطابقة"] == "تطابق مرتفع - مراجعة").sum(),
+                            (results["حالة المطابقة"] == "يحتاج مراجعة").sum(),
+                            (results["حالة المطابقة"] == "غير موجود").sum(),
+                            len(unmatched)
                         ]
                     })
 
-                    st.session_state["results"] = results
-                    st.session_state["summary"] = summary
-                    st.session_state["dup1"] = None
-                    st.session_state["dup2"] = None
+                    st.session_state["report_sheets"] = {
+                        "ملخص التحليل": summary,
+                        "كل النتائج": results,
+                        "غير المقابلة": unmatched
+                    }
 
-    except Exception as e:
-        st.error(f"حدث خطأ أثناء قراءة الملفات أو إعداد المطابقة: {e}")
+        # -------------------------
+        # عرض النتائج وتنزيل التقرير
+        # -------------------------
+
+        if "report_sheets" in st.session_state:
+            st.divider()
+            st.header("3. نتائج المطابقة")
+
+            sheets = st.session_state["report_sheets"]
+            summary = sheets["ملخص التحليل"]
+            results = sheets["كل النتائج"]
+
+            st.dataframe(
+                summary,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader("تفاصيل النتائج")
+            st.dataframe(
+                results,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            if "غير المقابلة" in sheets:
+                st.subheader(
+                    "السجلات الموجودة في الملف المقابل وغير المرتبطة"
+                )
+                st.dataframe(
+                    sheets["غير المقابلة"],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            for name in ["تكرار الملف الأول", "تكرار الملف الثاني"]:
+                if name in sheets:
+                    st.subheader(name)
+                    st.dataframe(
+                        sheets[name],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            report = make_report(sheets)
+
+            st.download_button(
+                "📥 تنزيل تقرير المطابقة Excel",
+                data=report,
+                file_name="Smart_Excel_Matching_Report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            st.warning(
+                "المطابقة الذكية تقديرية وليست إثباتاً نهائياً. "
+                "راجع الحالات الملتبسة يدوياً قبل اعتماد النتائج."
+            )
+
+    except Exception as error:
+        st.error(
+            "حدث خطأ أثناء قراءة الملفات أو المطابقة. "
+            f"تفاصيل الخطأ: {error}"
+        )
 
 
-if "results" in st.session_state:
-    st.markdown("---")
-    st.markdown("## 4. نتائج المطابقة")
-
-    results = st.session_state["results"]
-    summary = st.session_state["summary"]
-
-    a, b, c = st.columns(3)
-    a.metric("إجمالي سجلات الملف الأول", len(results))
-    b.metric(
-        "السجلات المتطابقة",
-        (results["حالة المطابقة"] == "متطابق").sum()
-    )
-    c.metric(
-        "السجلات غير الموجودة",
-        results["حالة المطابقة"].astype(str).str.contains("غير موجود").sum()
-    )
-
-    st.dataframe(results, use_container_width=True, hide_index=True)
-
-    st.markdown("### ملخص التحليل")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    report = to_excel(
-        results,
-        summary,
-        st.session_state.get("dup1"),
-        st.session_state.get("dup2")
-    )
-
-    st.download_button(
-        "📥 تنزيل تقرير المطابقة Excel",
-        data=report,
-        file_name="تقرير_المطابقة.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    st.warning(
-        "نسب التشابه مؤشرات مساعدة وليست إثباتاً نهائياً لهوية المستفيد. "
-        "راجع الحالات الملتبسة يدوياً قبل اعتماد أي إجراء."
-    )
-
-st.markdown("---")
-st.caption("Smart Excel Matcher | أداة مساعدة لمقارنة ملفات Excel")
+st.divider()
+st.caption(
+    "Smart Excel Matcher | أداة لمقارنة ومطابقة ملفات Excel"
+)
