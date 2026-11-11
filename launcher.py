@@ -15,18 +15,14 @@ def open_browser(url):
     webbrowser.open(url)
 
 def main():
-    # Disable development mode before Streamlit loads its configuration.
+    # Force Streamlit out of development mode before importing its CLI.
     os.environ["STREAMLIT_GLOBAL_DEVELOPMENTMODE"] = "false"
-
-    import streamlit.config as stconfig
-    stconfig.set_option("global.developmentMode", False)
 
     import streamlit.web.cli as stcli
 
     app_file = str(resource_path("app.py"))
-    # Use Streamlit's default port. Do not pass --server.port:
-    # Streamlit rejects an explicitly configured port in development mode.
-    url = "http://127.0.0.1:8501"
+    port = 8501
+    url = f"http://127.0.0.1:{port}"
 
     threading.Thread(
         target=open_browser,
@@ -39,8 +35,10 @@ def main():
         "run",
         app_file,
         "--server.address=127.0.0.1",
+        f"--server.port={port}",
         "--server.headless=true",
-        "--browser.gatherUsageStats=false"
+        "--browser.gatherUsageStats=false",
+        "--global.developmentMode=false"
     ]
 
     stcli.main()
