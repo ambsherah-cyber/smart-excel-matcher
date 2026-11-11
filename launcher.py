@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -24,7 +23,11 @@ def open_browser(url):
     webbrowser.open(url)
 
 def main():
+    # Disable Streamlit development mode before its CLI loads configuration.
     os.environ["STREAMLIT_GLOBAL_DEVELOPMENTMODE"] = "false"
+
+    import streamlit.config as stconfig
+    stconfig.set_option("global.developmentMode", False)
 
     import streamlit.web.cli as stcli
 
