@@ -24,6 +24,8 @@ def open_browser(url):
     webbrowser.open(url)
 
 def main():
+    os.environ["STREAMLIT_GLOBAL_DEVELOPMENTMODE"] = "false"
+
     import streamlit.web.cli as stcli
 
     app_file = str(resource_path("app.py"))
